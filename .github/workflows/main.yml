@@ -1,100 +1,355 @@
 name: RDP
+
 on:
   workflow_dispatch:
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
+
     steps:
+
+      # =========================================================
+      # 1. CONFIGURATION RDP
+      # =========================================================
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Write-Host "Configuring Remote Desktop..."
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          # Disable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0 `
+            -Force
+
+          # Security layer
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 0 `
+            -Force
+
+          # Remove old firewall rule if it exists
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          # Allow RDP
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          # Restart Remote Desktop service
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) +
-                       [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          if (-not (Get-LocalUser -Name "RDP")) {
-            Write-Error "User creation failed"
+          # Verify RDP service
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Write-Error "Remote Desktop service is not running."
             exit 1
           }
 
+          Write-Host "Remote Desktop configured successfully."
+
+
+      # =========================================================
+      # 2. CREATION UTILISATEUR RDP
+      # =========================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Write-Host "Creating RDP user..."
+
+          # Generate a random password
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $numbers = [char[]](48..57)
+          $special = [char[]](33..47)
+
+          $passwordChars = @()
+
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
+
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Remove old user if it exists
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
+          # Create user
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -Description "GitHub Actions RDP user"
+
+          # Add required groups
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP"
+
+          # Verify user
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "Failed to create RDP user."
+            exit 1
+          }
+
+          # Store credentials as GitHub environment variables
+          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          # Mask password in GitHub logs
+          Write-Output "::add-mask::$password"
+
+          Write-Host "RDP user created successfully."
+
+
+      # =========================================================
+      # 3. INSTALLATION DE TAILSCALE
+      # =========================================================
       - name: Install Tailscale
+        shell: powershell
         run: |
+          Write-Host "Installing Tailscale..."
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
 
+          # Build temporary path safely
+          $installerPath = Join-Path `
+            -Path $env:TEMP `
+            -ChildPath "tailscale.msi"
+
+          Write-Host "Installer path:"
+          Write-Host $installerPath
+
+          # Download
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath `
+            -UseBasicParsing
+
+          # Verify download
+          if (-not (Test-Path $installerPath)) {
+            Write-Error "Tailscale installer was not downloaded."
+            exit 1
+          }
+
+          Write-Host "Tailscale installer downloaded."
+
+          # Install
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+              "/i",
+              "`"$installerPath`"",
+              "/quiet",
+              "/norestart"
+            ) `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Tailscale installation failed. Exit code: $($process.ExitCode)"
+            exit 1
+          }
+
+          # Verify executable
+          $tailscaleExe = Join-Path `
+            -Path $env:ProgramFiles `
+            -ChildPath "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+            Write-Error "Tailscale executable was not found."
+            exit 1
+          }
+
+          Remove-Item `
+            -Path $installerPath `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Tailscale installed successfully."
+
+
+      # =========================================================
+      # 4. CONNEXION TAILSCALE
+      # =========================================================
       - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          # Wait for Tailscale to assign an IP
+          $tailscaleExe = Join-Path `
+            -Path $env:ProgramFiles `
+            -ChildPath "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+            Write-Error "Tailscale executable not found."
+            exit 1
+          }
+
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing."
+            exit 1
+          }
+
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          Write-Host "Connecting to Tailscale..."
+          Write-Host "Hostname: $hostname"
+
+          & $tailscaleExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tailscale connection failed."
+            exit 1
+          }
+
+          Write-Host "Tailscale connected."
+
+          # Wait for IPv4 address
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            Start-Sleep -Seconds 5
-            $retries++
+
+          for ($i = 1; $i -le 20; $i++) {
+
+            Write-Host "Waiting for Tailscale IP... attempt $i/20"
+
+            $result = & $tailscaleExe ip -4 2>$null
+
+            if ($result) {
+              $candidate = ($result | Select-Object -First 1).Trim()
+
+              if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                $tsIP = $candidate
+                break
+              }
+            }
+
+            Start-Sleep -Seconds 3
           }
+
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Exiting."
+            Write-Error "Tailscale IPv4 address was not assigned."
             exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+          # Save IP for later steps
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "Tailscale IPv4 address obtained."
+          Write-Host "IP: $tsIP"
+
+
+      # =========================================================
+      # 5. VERIFICATION RDP
+      # =========================================================
+      - name: Verify RDP
+        shell: powershell
         run: |
+          Write-Host "Checking Remote Desktop..."
+
+          # Check service
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Write-Error "TermService is not running."
+            exit 1
+          }
+
+          # Check port locally
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            Write-Error "RDP is not listening on TCP port 3389."
+            exit 1
+          }
+
+          Write-Host "RDP is listening on TCP port 3389."
+
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
+
+          # Test local RDP TCP connection
+          $test = Test-NetConnection `
+            -ComputerName "127.0.0.1" `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "Local TCP connection to RDP port 3389 failed."
             exit 1
           }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+          Write-Host "RDP TCP test successful."
+
+
+      # =========================================================
+      # 6. AFFICHAGE DES INFORMATIONS
+      # =========================================================
+      - name: Display RDP Information
+        shell: powershell
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "           RDP ACCESS INFORMATION"
+          Write-Host "=========================================="
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USERNAME"
+          Write-Host "Password : [HIDDEN]"
+          Write-Host "Port     : 3389"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "The password is stored in the GitHub environment"
+          Write-Host "and is intentionally not printed in the logs."
+
+
+      # =========================================================
+      # 7. MAINTIEN DU RUNNER
+      # =========================================================
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "          RDP SESSION ACTIVE"
+          Write-Host "=========================================="
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : $env:RDP_USERNAME"
+          Write-Host "Port     : 3389"
+          Write-Host "=========================================="
+          Write-Host ""
+
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active"
             Start-Sleep -Seconds 300
           }
